@@ -1,0 +1,351 @@
+<#
+=====================================================================
+ PC Check - read-only scan for unknown executables/DLLs and USB history
+=====================================================================
+ WHAT THIS SCRIPT DOES
+  1. Lists running processes and loaded DLLs that are NOT validly signed.
+  2. Looks for impostor system names (e.g. TiWorker.exe outside WinSxS).
+  3. Scans common user-writable folders for recent .exe/.dll/.sys files,
+     checks digital signatures, hashes them and flags suspicious ones.
+  4. Lists loaded kernel drivers that are unsigned.
+  5. Reads USB device history (what was plugged in, and when).
+
+ WHAT IT DOES NOT DO
+  - It does not change, delete or quarantine anything.
+  - It does not upload anything. The report is saved locally and the
+    person running it decides whether to send it.
+  - No live monitoring. It runs once and exits.
+
+ A flag is a LEAD, not proof of cheating. Unsigned hobby tools, overclock
+ utilities and old launchers also get flagged.
+
+ USAGE (run PowerShell as Administrator)
+   .\check.ps1
+   .\check.ps1 -DaysBack 30        # only files changed in last 30 days
+   .\check.ps1 -SkipConsent        # skip the confirmation prompt
+=====================================================================
+#>
+
+[CmdletBinding()]
+param(
+    [int]$DaysBack = 90,
+    [switch]$SkipConsent
+)
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# ---------- Consent + admin check ----------
+Write-Host "`n=== PC Check (read-only) ===" -ForegroundColor Cyan
+Write-Host "This reads processes, DLLs, files in user folders, drivers and USB history."
+Write-Host "Nothing is modified or uploaded. A report is saved to your Desktop.`n"
+
+if (-not $SkipConsent) {
+    $answer = Read-Host "Do you agree to run this check on this computer? (y/n)"
+    if ($answer -notmatch '^(y|yes)$') { Write-Host "Cancelled."; return }
+}
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "Warning: not running as Administrator. Some results (modules, USB, drivers) will be incomplete." -ForegroundColor Yellow
+}
+
+# ---------- Output folder ----------
+$stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
+$outDir  = Join-Path ([Environment]::GetFolderPath('Desktop')) "PCCheck_$stamp"
+New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+$summary = Join-Path $outDir 'summary.txt'
+
+function Log([string]$msg) {
+    $msg | Tee-Object -FilePath $summary -Append | Out-Host
+}
+
+Log "PC Check started: $(Get-Date)"
+Log "Computer: $env:COMPUTERNAME   User: $env:USERNAME   Admin: $isAdmin"
+Log "Look-back window for file scan: $DaysBack days`n"
+
+# ---------- Helpers ----------
+$sigCache = @{}
+function Get-SigInfo([string]$path) {
+    if ($sigCache.ContainsKey($path)) { return $sigCache[$path] }
+    $s = Get-AuthenticodeSignature -FilePath $path
+    $signer = $null
+    if ($s.SignerCertificate) {
+        $signer = ($s.SignerCertificate.Subject -split ',')[0] -replace '^CN=',''
+    }
+    $info = [PSCustomObject]@{ Status = "$($s.Status)"; Signer = $signer }
+    $sigCache[$path] = $info
+    return $info
+}
+
+# Legit system binaries and where they should live
+$expectedPaths = @{
+    'svchost.exe'        = @('C:\Windows\System32\','C:\Windows\SysWOW64\')
+    'csrss.exe'          = @('C:\Windows\System32\')
+    'lsass.exe'          = @('C:\Windows\System32\')
+    'services.exe'       = @('C:\Windows\System32\')
+    'smss.exe'           = @('C:\Windows\System32\')
+    'wininit.exe'        = @('C:\Windows\System32\')
+    'winlogon.exe'       = @('C:\Windows\System32\')
+    'explorer.exe'       = @('C:\Windows\')
+    'dwm.exe'            = @('C:\Windows\System32\')
+    'taskhostw.exe'      = @('C:\Windows\System32\')
+    'runtimebroker.exe'  = @('C:\Windows\System32\')
+    'conhost.exe'        = @('C:\Windows\System32\')
+    'dllhost.exe'        = @('C:\Windows\System32\','C:\Windows\SysWOW64\')
+    'searchindexer.exe'  = @('C:\Windows\System32\')
+    'tiworker.exe'       = @('C:\Windows\WinSxS\')
+    'trustedinstaller.exe' = @('C:\Windows\servicing\')
+}
+
+function Test-ImpostorName([string]$path) {
+    $name = [IO.Path]::GetFileName($path).ToLower()
+    if ($expectedPaths.ContainsKey($name)) {
+        foreach ($ok in $expectedPaths[$name]) {
+            if ($path.StartsWith($ok, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        }
+        return $true
+    }
+    return $false
+}
+
+# Rough check for random/gibberish file names
+function Test-GibberishName([string]$path) {
+    $base = [IO.Path]::GetFileNameWithoutExtension($path)
+    if ($base.Length -lt 8) { return $false }
+    if ($base -notmatch '^[A-Za-z0-9]+$') { return $false }
+    $vowels = ([regex]::Matches($base.ToLower(), '[aeiou]')).Count
+    $digits = ([regex]::Matches($base, '\d')).Count
+    $ratio  = $vowels / $base.Length
+    $mixedCase = ($base -cmatch '[a-z]') -and ($base -cmatch '[A-Z]') -and ($digits -gt 0)
+    return ($ratio -lt 0.2) -or $mixedCase -or ($base -match '^[0-9a-f]{12,}$')
+}
+
+# ======================================================
+# 1. Running processes and loaded DLLs
+# ======================================================
+Log "[1/5] Checking running processes and loaded modules..."
+$procFindings = New-Object System.Collections.Generic.List[object]
+$seen = @{}
+
+foreach ($p in Get-Process) {
+    $paths = @()
+    if ($p.Path) { $paths += [PSCustomObject]@{ Type='EXE'; Path=$p.Path } }
+    try {
+        foreach ($m in $p.Modules) {
+            if ($m.FileName) { $paths += [PSCustomObject]@{ Type='DLL'; Path=$m.FileName } }
+        }
+    } catch {}
+
+    foreach ($item in $paths) {
+        $key = "$($p.Id)|$($item.Path)"
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        if (-not (Test-Path -LiteralPath $item.Path)) { continue }
+
+        $sig = Get-SigInfo $item.Path
+        $impostor = Test-ImpostorName $item.Path
+        $gibber   = Test-GibberishName $item.Path
+        $unsigned = $sig.Status -ne 'Valid'
+
+        if ($unsigned -or $impostor -or $gibber) {
+            $procFindings.Add([PSCustomObject]@{
+                Process   = $p.ProcessName
+                PID       = $p.Id
+                Type      = $item.Type
+                Path      = $item.Path
+                Signature = $sig.Status
+                Signer    = $sig.Signer
+                ImpostorName = $impostor
+                GibberishName = $gibber
+                SHA256    = (Get-FileHash -LiteralPath $item.Path -Algorithm SHA256).Hash
+            })
+        }
+    }
+}
+$procFindings | Sort-Object -Property @{e='ImpostorName';Descending=$true}, Signature |
+    Export-Csv (Join-Path $outDir 'processes_modules_flagged.csv') -NoTypeInformation
+Log "    Flagged items: $($procFindings.Count)  ->  processes_modules_flagged.csv"
+
+# ======================================================
+# 2. Files in user-writable locations
+# ======================================================
+Log "`n[2/5] Scanning user-writable folders for recent executables/DLLs/drivers..."
+$cutoff = (Get-Date).AddDays(-$DaysBack)
+$roots = @(
+    $env:TEMP,
+    "$env:USERPROFILE\AppData\Roaming",
+    "$env:USERPROFILE\AppData\Local",
+    'C:\ProgramData',
+    "$env:USERPROFILE\Downloads",
+    "$env:USERPROFILE\Desktop",
+    "$env:USERPROFILE\Documents",
+    'C:\Users\Public'
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+$fileFindings = New-Object System.Collections.Generic.List[object]
+$count = 0
+foreach ($root in $roots) {
+    Write-Host "    Scanning $root"
+    Get-ChildItem -LiteralPath $root -Recurse -File -Force -Include *.exe,*.dll,*.sys,*.scr |
+        Where-Object { $_.LastWriteTime -ge $cutoff -or $_.CreationTime -ge $cutoff } |
+        ForEach-Object {
+            $count++
+            if ($count % 200 -eq 0) { Write-Host "      ...$count files checked" }
+            $sig = Get-SigInfo $_.FullName
+            $impostor = Test-ImpostorName $_.FullName
+            $gibber   = Test-GibberishName $_.FullName
+            $unsigned = $sig.Status -ne 'Valid'
+            if ($unsigned -or $impostor -or $gibber) {
+                $fileFindings.Add([PSCustomObject]@{
+                    Path      = $_.FullName
+                    SizeKB    = [math]::Round($_.Length / 1KB, 1)
+                    Created   = $_.CreationTime
+                    Modified  = $_.LastWriteTime
+                    Signature = $sig.Status
+                    Signer    = $sig.Signer
+                    ImpostorName  = $impostor
+                    GibberishName = $gibber
+                    SHA256    = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+                })
+            }
+        }
+}
+$fileFindings | Sort-Object Modified -Descending |
+    Export-Csv (Join-Path $outDir 'files_flagged.csv') -NoTypeInformation
+Log "    Files checked: $count   Flagged: $($fileFindings.Count)  ->  files_flagged.csv"
+
+# Publishers found on valid-signed files, for human review
+$signers = $sigCache.GetEnumerator() | Where-Object { $_.Value.Status -eq 'Valid' -and $_.Value.Signer } |
+    ForEach-Object { $_.Value.Signer } | Group-Object | Sort-Object Count -Descending |
+    Select-Object Count, Name
+$signers | Export-Csv (Join-Path $outDir 'signers_seen.csv') -NoTypeInformation
+
+# ======================================================
+# 3. Loaded kernel drivers
+# ======================================================
+Log "`n[3/5] Checking loaded kernel drivers..."
+$drvFindings = New-Object System.Collections.Generic.List[object]
+Get-CimInstance Win32_SystemDriver | Where-Object { $_.State -eq 'Running' } | ForEach-Object {
+    $p = ($_.PathName -replace '^\\\?\?\\','') -replace '"',''
+    if ($p -and (Test-Path -LiteralPath $p)) {
+        $sig = Get-SigInfo $p
+        $drvFindings.Add([PSCustomObject]@{
+            Name = $_.Name; Path = $p; Signature = $sig.Status; Signer = $sig.Signer
+            SHA256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash
+        })
+    }
+}
+$drvFindings | Export-Csv (Join-Path $outDir 'drivers_all_running.csv') -NoTypeInformation
+$drvBad = $drvFindings | Where-Object { $_.Signature -ne 'Valid' }
+$drvBad | Export-Csv (Join-Path $outDir 'drivers_unsigned.csv') -NoTypeInformation
+Log "    Running drivers: $($drvFindings.Count)   Not validly signed: $(@($drvBad).Count)"
+Log "    Tip: compare SHA256 values in drivers_all_running.csv with loldrivers.io."
+
+# ======================================================
+# 4. USB history
+# ======================================================
+Log "`n[4/5] Reading USB history..."
+$usb = New-Object System.Collections.Generic.List[object]
+
+# DEVPKEY_Device_* date properties
+$guid = '{83da6326-97a6-4088-9453-a1923f573b29}'
+function Get-DevDate($id, $n) {
+    $v = (Get-PnpDeviceProperty -InstanceId $id -KeyName "$guid $n").Data
+    if ($v -is [datetime]) { return $v } else { return $null }
+}
+
+# Storage devices (USBSTOR) - flash drives, external disks
+$stor = 'HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR'
+if (Test-Path $stor) {
+    foreach ($dev in Get-ChildItem $stor) {
+        foreach ($inst in Get-ChildItem $dev.PSPath) {
+            $id = "USBSTOR\$($dev.PSChildName)\$($inst.PSChildName)"
+            $props = Get-ItemProperty $inst.PSPath
+            $usb.Add([PSCustomObject]@{
+                Kind         = 'Storage'
+                Device       = $props.FriendlyName
+                Class        = $props.Class
+                Serial       = $inst.PSChildName
+                DeviceKey    = $dev.PSChildName
+                FirstInstall = Get-DevDate $id 101
+                LastConnected = Get-DevDate $id 102
+                LastRemoved  = Get-DevDate $id 103
+            })
+        }
+    }
+}
+
+# All other USB devices (VID/PID): keyboards, mice, adapters, microcontrollers, etc.
+$usbRoot = 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB'
+if (Test-Path $usbRoot) {
+    foreach ($dev in Get-ChildItem $usbRoot) {
+        foreach ($inst in Get-ChildItem $dev.PSPath) {
+            $id = "USB\$($dev.PSChildName)\$($inst.PSChildName)"
+            $props = Get-ItemProperty $inst.PSPath
+            $usb.Add([PSCustomObject]@{
+                Kind         = 'USB device'
+                Device       = if ($props.FriendlyName) { $props.FriendlyName } else { $props.DeviceDesc -replace '^.*;','' }
+                Class        = $props.Class
+                Serial       = $inst.PSChildName
+                DeviceKey    = $dev.PSChildName
+                FirstInstall = Get-DevDate $id 101
+                LastConnected = Get-DevDate $id 102
+                LastRemoved  = Get-DevDate $id 103
+            })
+        }
+    }
+}
+$usb | Sort-Object LastConnected -Descending |
+    Export-Csv (Join-Path $outDir 'usb_history.csv') -NoTypeInformation
+$storCount = @($usb | Where-Object Kind -eq 'Storage').Count
+Log "    USB entries: $($usb.Count)  (storage devices: $storCount)  ->  usb_history.csv"
+
+# First-connection records from setupapi log (survives some registry cleanup)
+$setupLog = 'C:\Windows\INF\setupapi.dev.log'
+if (Test-Path $setupLog) {
+    $lines = Get-Content $setupLog
+    $out = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^>>>\s+\[Device Install.*(USBSTOR|USB)\\(.+?)\]') {
+            $start = ''
+            for ($j = $i; $j -lt [Math]::Min($i + 4, $lines.Count); $j++) {
+                if ($lines[$j] -match 'Section start (.+)$') { $start = $Matches[1]; break }
+            }
+            $out.Add([PSCustomObject]@{ Time = $start; Entry = $lines[$i].Trim() })
+        }
+    }
+    $out | Export-Csv (Join-Path $outDir 'usb_setupapi_firstseen.csv') -NoTypeInformation
+    Log "    setupapi.dev.log USB install records: $($out.Count)  ->  usb_setupapi_firstseen.csv"
+}
+
+# Plug/unplug events if the log was enabled
+$evt = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-DriverFrameworks-UserMode/Operational'; Id=2003,2100,2101,2102} -MaxEvents 500
+if ($evt) {
+    $evt | Select-Object TimeCreated, Id, Message |
+        Export-Csv (Join-Path $outDir 'usb_events.csv') -NoTypeInformation
+    Log "    USB plug events found: $($evt.Count)  ->  usb_events.csv"
+} else {
+    Log "    No USB plug events (that log is often disabled by default; the registry data above still applies)."
+}
+
+# ======================================================
+# 5. Summary
+# ======================================================
+Log "`n[5/5] Highest-priority leads"
+$top = @()
+$top += $procFindings | Where-Object { $_.ImpostorName } | ForEach-Object { "IMPOSTOR NAME (running): $($_.Path)" }
+$top += $fileFindings | Where-Object { $_.ImpostorName } | ForEach-Object { "IMPOSTOR NAME (on disk):  $($_.Path)" }
+$top += $procFindings | Where-Object { $_.Signature -ne 'Valid' -and $_.Type -eq 'EXE' } | ForEach-Object { "UNSIGNED RUNNING EXE:     $($_.Path)" }
+$top += $drvBad | ForEach-Object { "UNSIGNED DRIVER:           $($_.Path)" }
+$top += $fileFindings | Where-Object { $_.GibberishName -and $_.Signature -ne 'Valid' } | ForEach-Object { "RANDOM-NAME UNSIGNED:       $($_.Path)" }
+$top = $top | Select-Object -Unique
+if ($top) { $top | ForEach-Object { Log "  - $_" } } else { Log "  None of the high-priority patterns were found." }
+
+Log "`nDone: $(Get-Date)"
+Log "Report folder: $outDir"
+
+# Zip for easy sharing (still local - nothing is sent anywhere)
+$zip = "$outDir.zip"
+Compress-Archive -Path "$outDir\*" -DestinationPath $zip -Force
+Write-Host "`nZipped report: $zip" -ForegroundColor Green
+Write-Host "Review it yourself first; send it only if you choose to." -ForegroundColor Green
